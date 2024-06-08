@@ -1,0 +1,201 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+# ------------------------------------------------------------#
+# Input Parameters
+# ------------------------------------------------------------#
+Parameters:
+  VpcId:
+    Type: String
+    Default: ""
+  PublicSubnetA:
+    Type: String
+    Default: ""
+  PublicSubnetB:
+    Type: String
+    Default: ""
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: ""
+
+Resources:
+# ------------------------------------------------------------#
+#  IAM Role for EC2
+# ------------------------------------------------------------#
+  EC2IAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: sample-instance-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - "ec2.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM"
+        - "arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess"
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+        - Ref: EC2IAMRole
+      InstanceProfileName: sample-instance-profile
+
+# ------------------------------------------------------------#
+#  EC2Instance
+# ------------------------------------------------------------#
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+      InstanceType: t2.micro
+      KeyName: !Ref KeyPairName
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      DisableApiTermination: false
+      SecurityGroupIds:
+        - !Ref ManagedSecurityGroup
+        - !Ref WebSecurityGroup
+      SubnetId: { "Fn::ImportValue": !Ref PublicSubnetA }
+      Tags:
+        - Key: Name
+          Value: my-ec2
+
+# ------------------------------------------------------------#
+#  SecurityGroup for Managed
+# ------------------------------------------------------------#
+  ManagedSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      VpcId: { "Fn::ImportValue": !Ref VpcId }
+      GroupName: sample-managed-sg
+      GroupDescription: "-"
+
+# ------------------------------------------------------------#
+#  SecurityGroup for ALB
+# ------------------------------------------------------------#
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: { "Fn::ImportValue": !Ref VpcId }
+      GroupName: !Sub "sample-alb-sg"
+      GroupDescription: "-"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: "0.0.0.0/0"
+
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: "0.0.0.0/0"
+
+# ------------------------------------------------------------#
+#  SecurityGroup for Web
+# ------------------------------------------------------------#
+  WebSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: { "Fn::ImportValue": !Ref VpcId }
+      GroupName: sample-web-sg
+      GroupDescription: "-"
+
+# Rule
+  WebSecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourceSecurityGroupId: !GetAtt [ ALBSecurityGroup, GroupId ]
+      GroupId: !GetAtt [ WebSecurityGroup, GroupId ]
+
+# ------------------------------------------------------------#
+#  ElasticIP
+# ------------------------------------------------------------#
+  ElasticIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  ElasticIPAssociate:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt ElasticIP.AllocationId
+      InstanceId: !Ref EC2Instance
+
+# ------------------------------------------------------------#
+#  Target Group
+# ------------------------------------------------------------#
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: { "Fn::ImportValue": !Ref VpcId }
+      Name: sample-tg
+      Protocol: HTTP
+      Port: 80
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: "/"
+      HealthCheckPort: "traffic-port"
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      HealthCheckTimeoutSeconds: 5
+      HealthCheckIntervalSeconds: 10
+      Matcher:
+        HttpCode: 200
+      TargetGroupAttributes:
+        - Key: "deregistration_delay.timeout_seconds"
+          Value: 300
+        - Key: "stickiness.enabled"
+          Value: false
+        - Key: "stickiness.type"
+          Value: lb_cookie
+        - Key: "stickiness.lb_cookie.duration_seconds"
+          Value: 86400
+      Targets:
+        - Id: !Ref EC2Instance
+          Port: 80
+
+# ------------------------------------------------------------#
+#  Internet ALB
+# ------------------------------------------------------------#
+  InternetALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: sample-alb
+      Scheme: "internet-facing"
+      LoadBalancerAttributes:
+        - Key: "deletion_protection.enabled"
+          Value: false
+        - Key: "idle_timeout.timeout_seconds"
+          Value: 60
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Subnets:
+        - { "Fn::ImportValue": !Ref PublicSubnetA }
+        - { "Fn::ImportValue": !Ref PublicSubnetB }
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref TargetGroup
+          Type: forward
+      LoadBalancerArn: !Ref InternetALB
+      Port: 80
+      Protocol: HTTP
+
+# ------------------------------------------------------------#
+# Output Parameters
+# ------------------------------------------------------------#
+Outputs:
+  EC2InstanceID:
+    Value: !Ref EC2Instance
+    Export:
+      Name: sample-instance-id
